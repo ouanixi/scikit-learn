@@ -30,6 +30,7 @@ from .base import BaseEnsemble
 from ..base import BaseEstimator
 from ..base import ClassifierMixin
 from ..base import RegressorMixin
+from ..base import is_classifier
 from ..externals import six
 from ..feature_selection.from_model import _LearntSelectorMixin
 
@@ -932,25 +933,21 @@ class BaseGradientBoosting(six.with_metaclass(ABCMeta, BaseEnsemble,
 
     def fit(self, X, y, sample_weight=None, monitor=None):
         """Fit the gradient boosting model.
-
         Parameters
         ----------
         X : array-like, shape = [n_samples, n_features]
             Training vectors, where n_samples is the number of samples
             and n_features is the number of features.
-
         y : array-like, shape = [n_samples]
             Target values (integers in classification, real numbers in
             regression)
             For classification, labels must correspond to classes.
-
         sample_weight : array-like, shape = [n_samples] or None
             Sample weights. If None, then samples are equally weighted. Splits
             that would create child nodes with net zero or negative weight are
             ignored while searching for a split in each node. In the case of
             classification, splits are also ignored if they would result in any
             single class carrying a negative weight in either child node.
-
         monitor : callable, optional
             The monitor is called after each iteration with the current
             iteration, a reference to the estimator and the local variables of
@@ -959,7 +956,6 @@ class BaseGradientBoosting(six.with_metaclass(ABCMeta, BaseEnsemble,
             is stopped. The monitor can be used for various things such as
             computing held-out estimates, early stopping, model introspect, and
             snapshoting.
-
         Returns
         -------
         self : object
@@ -970,7 +966,7 @@ class BaseGradientBoosting(six.with_metaclass(ABCMeta, BaseEnsemble,
             self._clear_state()
 
         # Check input
-        X, y = check_X_y(X, y, accept_sparse=['csr', 'csc', 'coo'], dtype=DTYPE)
+        X, y = check_X_y(X, y, dtype=DTYPE)
         n_samples, self.n_features = X.shape
         if sample_weight is None:
             sample_weight = np.ones(n_samples, dtype=np.float32)
@@ -978,9 +974,7 @@ class BaseGradientBoosting(six.with_metaclass(ABCMeta, BaseEnsemble,
             sample_weight = column_or_1d(sample_weight, warn=True)
 
         check_consistent_length(X, y, sample_weight)
-
         y = self._validate_y(y)
-
         random_state = check_random_state(self.random_state)
         self._check_params()
 
@@ -991,8 +985,41 @@ class BaseGradientBoosting(six.with_metaclass(ABCMeta, BaseEnsemble,
             # fit initial model - FIXME make sample_weight optional
             self.init_.fit(X, y, sample_weight)
 
-            # init predictions
-            y_pred = self.init_.predict(X)
+            if is_classifier(self.init_):
+                n_classes = np.unique(y).shape[0]
+            else:
+                n_classes = 1
+
+            # If the initialization estimator has a predict_proba method,
+            # either use those, or collapse to a single vector of the
+            # predicted log odds in the binary classification case. The
+            # binomial loss used in binary classification problems expects
+            # the log odds rather than predicted positive class probability.
+            if hasattr(self.init_, 'predict_proba'):
+                eps = np.finfo(X.dtype).eps
+                y_pred = self.init_.predict_proba(X) + eps
+                if n_classes == 2:
+                    y_pred = np.log(y_pred[:, 1] / y_pred[:, 0])
+                    y_pred = y_pred.reshape(n_samples, 1)
+
+            # Otherwise, it can be a naive estimator defined above, in which
+            # case don't do anything, or a classifier whose estimates will be
+            # a vector that should be one hot encoded, or a regressor whose
+            # estimates still need to be reshaped from (n_samples,) to
+            # (n_samples, 1)
+            else:
+                pred = self.init_.predict(X)
+
+                if len(pred.shape) < 2:
+                    if is_classifier(self.init_):
+                        raise ValueError("init model must have a "
+                                         "'predict_proba' method if a "
+                                         "classifier")
+                    else:
+                        y_pred = pred.reshape(n_samples, 1)
+                else:
+                    y_pred = pred
+
             begin_at_stage = 0
         else:
             # add more estimators to fitted model
@@ -1007,25 +1034,16 @@ class BaseGradientBoosting(six.with_metaclass(ABCMeta, BaseEnsemble,
             y_pred = self._decision_function(X)
             self._resize_state()
 
-        X_idx_sorted = None
-        presort = self.presort
-        # Allow presort to be 'auto', which means True if the dataset is dense,
-        # otherwise it will be False.
-        if presort == 'auto' and issparse(X):
-            presort = False
-        elif presort == 'auto':
-            presort = True
-
-        if presort == True:
-            if issparse(X):
-                raise ValueError("Presorting is not supported for sparse matrices.")
+            if is_classifier(self.init_):
+                n_classes = np.unique(y).shape[0]
             else:
-                X_idx_sorted = np.asfortranarray(np.argsort(X, axis=0),
-                                                 dtype=np.int32)
+                n_classes = 1
+
+        self.n_classes = n_classes
 
         # fit the boosting stages
         n_stages = self._fit_stages(X, y, y_pred, sample_weight, random_state,
-                                    begin_at_stage, monitor, X_idx_sorted)
+                                    begin_at_stage, monitor)
         # change shape of arrays after fit (early-stopping or additional ests)
         if n_stages != self.estimators_.shape[0]:
             self.estimators_ = self.estimators_[:n_stages]
@@ -1111,11 +1129,32 @@ class BaseGradientBoosting(six.with_metaclass(ABCMeta, BaseEnsemble,
     def _init_decision_function(self, X):
         """Check input and compute prediction of ``init``. """
         self._check_initialized()
-        X = self.estimators_[0, 0]._validate_X_predict(X, check_input=True)
         if X.shape[1] != self.n_features:
             raise ValueError("X.shape[1] should be {0:d}, not {1:d}.".format(
                 self.n_features, X.shape[1]))
-        score = self.init_.predict(X).astype(np.float64)
+            # init predictions
+
+        if hasattr(self.init_, 'predict_proba'):
+            eps = np.finfo(X.dtype).eps
+            score = self.init_.predict_proba(X) + eps
+            if self.n_classes == 2:
+                score = np.log(score[:, 1] / score[:, 0])
+                score = score.reshape(X.shape[0], 1)
+        else:
+            pred = self.init_.predict(X)
+
+            if len(pred.shape) < 2:
+                if is_classifier(self.init_):
+                    raise ValueError("init model must have a "
+                                     "'predict_proba' method if a "
+                                     "classifier")
+                else:
+                    score = pred.reshape(X.shape[0], 1)
+            else:
+                score = pred
+
+        score = score.astype(np.float64)
+
         return score
 
     def _decision_function(self, X):
